@@ -2,10 +2,11 @@ import pandas as pd
 from datatrove.pipeline.readers import ParquetReader
 from functools import lru_cache
 
-limit = 10000
+limit = 1000
 
 data_reader = ParquetReader(
-    "hf://datasets/HuggingFaceFW/fineweb-edu/sample/10BT", limit=limit,
+    "hf://datasets/HuggingFaceFW/fineweb-edu/sample/10BT",
+    limit=limit,
 )
 
 
@@ -28,6 +29,8 @@ DF = pd.DataFrame(documents)
 # Display the DataFrame
 print(DF.columns)
 
-for i in range(limit):
-    print(f"Text from iteration {i}: \n\n")
-    print(DF.iloc[i]["text"])
+with open('fineweb.txt', 'w', encoding='utf-8') as f:
+    for i in range(limit):
+        # print(f"Text from iteration {i}: \n\n")
+        f.write(DF.iloc[i]["text"])
+
