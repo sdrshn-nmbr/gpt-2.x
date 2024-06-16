@@ -289,14 +289,14 @@ class DataloaderLite:
 
 torch.cuda.manual_seed(1337)
 
-train_loader = DataloaderLite(B=4, T=1024)  # * max context/seq len of 1024
+train_loader = DataloaderLite(B=16, T=1024)  # * max context/seq len of 1024
 
 torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig)
 model.eval()
 model.to(device)
-mode = torch.compile(model)
+mode = torch.compile(model) # ! significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
 
 # Optim
 
