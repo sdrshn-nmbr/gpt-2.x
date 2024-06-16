@@ -20,17 +20,13 @@ def create_df(data_reader):
     return pd.DataFrame(docs)
 
 
-# Initialize an empty list to store documents
-documents = create_df(data_reader)
-
 # Convert the list of documents into a pandas DataFrame
-DF = pd.DataFrame(documents)
+DF = create_df(data_reader)
 
 # Display the DataFrame
 print(DF.columns)
 
-with open('fineweb.txt', 'w', encoding='utf-8') as f:
+with open("fineweb.txt", "w", encoding="utf-8") as f:
     for i in range(limit):
         # print(f"Text from iteration {i}: \n\n")
         f.write(DF.iloc[i]["text"])
-

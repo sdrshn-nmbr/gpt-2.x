@@ -1,12 +1,16 @@
 from dataclasses import dataclass
-import math
+import math, time
+
+import tiktoken
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
 
+
 device = "cuda"
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -61,6 +65,8 @@ class MLP(nn.Module):  # aka FFN
 
         # convert the dimension of input back to the embedding size
         self.c_proj: nn.Linear = nn.Linear(4 * config.n_embed, config.n_embed)
+
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
@@ -126,8 +132,27 @@ class GPT(nn.Module):
             config.n_embed, config.vocab_size, bias=False
         )
 
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                
+                # 2 times num layers for 1 attn and 2 mlp/ffn -> done to maintain std of 1 for weights/tensors | otherwise grows inside residual stream
+                std *= (2 * self.config.n_layer) ** -0.5
+            
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
-        #! idx is of shape (B, T)
+        # * idx is of shape (B, T)
         B, T = idx.size()
 
         assert (
@@ -149,12 +174,12 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        # loss = None
-        # if targets is not None:
-        #     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = None
+        if targets is not None:
+            # flattening out (B, T, vocab_size) into 2 dims -> (inferred, vocab size) = (B * T, vocab_size)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        # return logits, loss
-        return logits
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -224,15 +249,68 @@ class GPT(nn.Module):
         return model
 
 
-model = GPT.from_pretrained("gpt2-xl")
-# model = GPT(GPTConfig)
-print("didnt crash haha")
+class DataloaderLite:
+    def __init__(self, B, T):  # * again, B is num batches and T is sequence length
+        self.B, self.T = B, T
+
+        with open("fineweb.txt", "r", encoding="utf-8") as f:
+            text = f.read()
+
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.curr_pos = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+
+        buf = self.tokens[self.curr_pos : self.curr_pos + B * T + 1]
+        x = buf[:-1].view(B, T)  # inputs
+        y = buf[1:].view(B, T)  # targets
+
+        # advance position in the tensor
+        self.curr_pos += B * T
+
+        # if next batch causes out-of-bound reset to beginning
+        if self.curr_pos + (B * T + 1) > len(self.tokens):
+            self.curr_pos = 0
+
+        return x, y
+
+torch.cuda.manual_seed(1337)
+
+train_loader = DataloaderLite(B=8, T=1024) # max context/seq len of 1024
+
+model = GPT(GPTConfig)
 model.eval()
 model.to(device)
 
-# prefix tokens
-import tiktoken
+# Optim
 
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(500):  # 50 epochs
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()  #! intialize gradients as 0 -> always do this
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time diff in ms
+    print(f"step {i}: loss {loss.item()}: time: {dt} ms")
+
+import sys
+
+sys.exit(0)
+
+""" 
 num_return_sequences = 30
 max_length = 20
 
@@ -270,7 +348,4 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
-
-with open('fineweb.txt', 'r') as f:
-    text = f.read()
-    
+"""
