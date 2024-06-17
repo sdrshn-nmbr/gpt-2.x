@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-import math, time, inspect
+import math, time, inspect, os
 
 import tiktoken
 
@@ -7,7 +7,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-device = "cuda"
+from torch.distributed import init_process_group, destroy_process_group
+
+# ! setup DDP (Distributed Data Parallel)
+# * torchrun command sets env vars RANK, LOCAL_RANK, and WORLD_SIZE
+
+ddp = int(os.environ.get("RANK"), -1) != -1
+if ddp:
+    # ! DDP reqiuires cuda as of right now
+    assert torch.cuda.is_available(), "need cuda for DDP"
+
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # this process will do logging, checkpointing, etc.
+
+else:  # vanilla run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+
+    device = "cuda"
 
 
 class CausalSelfAttention(nn.Module):
@@ -355,13 +379,18 @@ total_B = 2**19  # approx 0.5 million (as used in GPT-3 paper)
 B = 8  # micro batch size
 T = 1024
 assert (
-    total_B % (B * T) == 0
-), "make sure total battch size is divisble by batch * seq lens"
+    total_B % (B * T * ddp_world_size) == 0
+), "make sure total battch size is divisble by batch * seq lens * num of gpus"
 
-grad_accum_steps = total_B // (B * T)
-print(f"total desired batch size: {total_B}")
-print(f"calculated gradient accumulation steps: {grad_accum_steps}")
+grad_accum_steps = total_B // (B * T * ddp_world_size)
 
+if master_process:
+    print(f"total desired batch size: {total_B}")
+    print(f"calculated gradient accumulation steps: {grad_accum_steps}")
+
+print(f"I am GPU {ddp_rank}")
+print("Bye")
+import sys; sys.exit(0)
 
 train_loader = DataloaderLite(B=B, T=T)  # * max context/seq len of 1024
 
