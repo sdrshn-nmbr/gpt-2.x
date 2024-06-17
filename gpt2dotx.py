@@ -12,8 +12,10 @@ from torch.distributed import init_process_group, destroy_process_group
 # ! setup DDP (Distributed Data Parallel)
 # * torchrun command sets env vars RANK, LOCAL_RANK, and WORLD_SIZE
 
+
+
 ddp = int(os.environ.get("RANK"), -1) != -1
-if ddp:
+if ddp: # ! -> torchrun --standalone --nproc_per_node=8 gpt2dotx.py
     # ! DDP reqiuires cuda as of right now
     assert torch.cuda.is_available(), "need cuda for DDP"
 
@@ -25,7 +27,7 @@ if ddp:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0  # this process will do logging, checkpointing, etc.
 
-else:  # vanilla run
+else:  # * vanilla run -> python gpt2dotx.py
     ddp_rank = 0
     ddp_local_rank = 0
     ddp_world_size = 1
