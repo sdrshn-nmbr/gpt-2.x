@@ -7,19 +7,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 # ! setup DDP (Distributed Data Parallel)
 # * torchrun command sets env vars RANK, LOCAL_RANK, and WORLD_SIZE
 
 
-
 ddp = int(os.environ.get("RANK"), -1) != -1
-if ddp: # ! -> torchrun --standalone --nproc_per_node=8 gpt2dotx.py
+if ddp:  # ! -> torchrun --standalone --nproc_per_node=8 gpt2dotx.py
     # ! DDP reqiuires cuda as of right now
     assert torch.cuda.is_available(), "need cuda for DDP"
 
-    init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
@@ -206,12 +207,12 @@ class GPT(nn.Module):
 
         # * forward the token and posiition embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # * shape (T)
-        pos_emb = self.transformer.wpe(
-            pos
-        )  # * position embeddings of shape (T, n_embed)
-        tok_emb = self.transformer.wte(
-            idx
-        )  # * token embeddings of shape (B, T, n_embed)
+
+        # * position embeddings of shape (T, n_embed)
+        pos_emb = self.transformer.wpe(pos)
+
+        # * token embeddings of shape (B, T, n_embed)
+        tok_emb = self.transformer.wte(idx)
 
         # * part where you add the (learnable) token embeddings with the (fixed) position embeddings
         x = tok_emb + pos_emb
@@ -260,6 +261,7 @@ class GPT(nn.Module):
         fused_avail = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_avail and "cuda" in device
         print(f"using fused AdamW: {use_fused}")
+
         optimizer = torch.optim.AdamW(
             optim_groups,
             lr=learning_rate,
@@ -339,8 +341,12 @@ class GPT(nn.Module):
 
 
 class DataloaderLite:
-    def __init__(self, B, T):  # * * again, B is num batches and T is sequence length
+    def __init__(
+        self, B, T, process_rank, num_process
+    ):  # * * again, B is num batches and T is sequence length
         self.B, self.T = B, T
+        self.process_rank = process_rank
+        self.num_process = num_process
 
         with open("fineweb.txt", "r", encoding="utf-8") as f:
             text = f.read()
@@ -350,10 +356,9 @@ class DataloaderLite:
 
         self.tokens = torch.tensor(tokens)
         print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # * state
-        self.curr_pos = 0
+        self.curr_pos = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -363,11 +368,11 @@ class DataloaderLite:
         y = buf[1:].view(B, T)  # * targets
 
         # * advance position in the tensor
-        self.curr_pos += B * T
+        self.curr_pos += B * T * self.num_process
 
         # * if next batch causes out-of-bound reset to beginning
         if self.curr_pos + (B * T + 1) > len(self.tokens):
-            self.curr_pos = 0
+            self.curr_pos = self.B * self.T * self.process_rank
 
         return x, y
 
@@ -390,11 +395,12 @@ if master_process:
     print(f"total desired batch size: {total_B}")
     print(f"calculated gradient accumulation steps: {grad_accum_steps}")
 
-print(f"I am GPU {ddp_rank}")
-print("Bye")
-import sys; sys.exit(0)
 
-train_loader = DataloaderLite(B=B, T=T)  # * max context/seq len of 1024
+train_loader = DataloaderLite(
+    B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size
+)  # * max context/seq len of 1024
+
+# ! ____________________________________________________________________________________________________
 
 torch.set_float32_matmul_precision("high")
 
@@ -404,8 +410,15 @@ model = GPT(
 # model.eval() # ! only for inference
 model.to(device)
 
-# ! significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
+# * significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
 model = torch.compile(model)
+
+# DPP container wrapping
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+# ! raw model required for optimizer
+raw_model = model.module if ddp else model
 
 # ! ____________________________________________________________________________________________________
 
@@ -431,7 +444,7 @@ def get_lr(step):
 
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(
+optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device=device
 )
 
@@ -450,7 +463,13 @@ for step in range(max_steps):
 
         loss /= grad_accum_steps  # bc of grad accum, we lose the mean part of mse -> this brings it back
         total_loss += loss.detach()
+
+        if ddp:
+            model.require_backward_grad_sync = model == grad_accum_steps - 1
         loss.backward()
+
+    if ddp:
+        dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
@@ -460,11 +479,16 @@ for step in range(max_steps):
     torch.cuda.synchronize()  # wait for GPU to finish work before CPU dpes/assigns more work
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
-    tps = tokens_processed // (t1 - t0)
-    print(
-        f"step {step:4d} | loss: {total_loss.item():.6f} | norm: {norm:.4f} | lr: {lr:.4e} | time: {dt} ms | tokens/s: {tps}"
+    tokens_processed = (
+        train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     )
+    tps = tokens_processed // (t1 - t0)
+    if master_process:
+        print(
+            f"step {step:4d} | loss: {total_loss.item():.6f} | norm: {norm:.4f} | lr: {lr:.4e} | time: {dt} ms | tokens/s: {tps}"
+        )
+if ddp:
+    dist.destroy_process_group()
 
 import sys
 
