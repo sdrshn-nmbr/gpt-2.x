@@ -8,9 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-device = "cuda"
-
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -307,9 +304,14 @@ class DataloaderLite:
         return x, y
 
 
+# * ____________________________________________________________________________________________________
+
+device = "cuda"
+
+
 torch.cuda.manual_seed(1337)
 
-train_loader = DataloaderLite(B=16, T=1024)  # * max context/seq len of 1024
+train_loader = DataloaderLite(B=8, T=1024)  # * max context/seq len of 1024
 
 torch.set_float32_matmul_precision("high")
 
@@ -318,14 +320,35 @@ model = GPT(
 )  # * overriding vocab size to be a *nice* number
 # model.eval() # ! only for inference
 model.to(device)
-model = torch.compile(
-    model
-)  # ! significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
 
-# Optim
+# ! significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
+model = torch.compile(model)
+
+# * ____________________________________________________________________________________________________
+
+max_lr = 3e-4
+min_lr = 0.1 * max_lr  # * 10% of max
+warmup_steps = 10  # * steps to get from 0 to max linearly
+max_steps = 50
+
+
+def get_lr(step):
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    elif step > max_steps:
+        return min_lr
+
+    else:  # in between -> cos decay ratio
+        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+        return min_lr + coeff(max_lr - min_lr)
+
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(100):
+for step in range(100):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -336,14 +359,17 @@ for i in range(100):
 
     loss.backward()
 
-    norm = torch.nn.utils.clip_grad_norm_(mode.parameters(), 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    lr = get_lr(step)
+    for param in optimizer.param_groups:
+        param["lr"] = lr
     torch.cuda.synchronize()  # wait for GPU to finish work before CPU dpes/assigns more work
     t1 = time.time()
-    dt = (t1 - t0) * 1000  # * time diff in ms
+    dt = t1 - t0
     tps = (train_loader.B * train_loader.T) // (t1 - t0)
     print(
-        f"step {i} | loss: {loss.item():.4f} | norm: {norm:.4f} | time: {dt} ms | tokens per second: {tps}"
+        f"step {step:4d} | loss: {loss.item():.4f} | norm: {norm:.4f} | lr: {lr:.4f} | time: {dt} s | tokens per second: {tps}"
     )
 
 import sys
