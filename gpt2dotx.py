@@ -339,23 +339,48 @@ class GPT(nn.Module):
 
         return model
 
+def load_tokens(file):
+    npt = np.load(file)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 
 class DataloaderLite:
     def __init__(
-        self, B, T, process_rank, num_process
+        self, B, T, process_rank, num_process, split
     ):  # * * again, B is num batches and T is sequence length
         self.B, self.T = B, T
         self.process_rank = process_rank
         self.num_process = num_process
 
-        with open("fineweb.txt", "r", encoding="utf-8") as f:
-            text = f.read()
+        assert split in {"train", "val"}
 
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
+        # get shard filenames and divide based on 'train' or 'split' being in the filename
 
-        self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens")
+        dataroot = "edu_fineweb10B"
+        shards = os.listdir(dataroot)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(dataroot, s) for s in shards]
+
+        self.shards = shards
+
+        assert len(shards) > 0, f"no shards found for split {split}"
+
+        if master_process:
+            print(f"found {len(shards)] for split {split}")
+
+        self.curr_shard = 0
+        self.tokens = load_tokens(self.shards[self.curr_shard)]
+        
+        # with open("fineweb.txt", "r", encoding="utf-8") as f:
+        #     text = f.read()
+
+        # enc = tiktoken.get_encoding("gpt2")
+        # tokens = enc.encode(text)
+
+        # self.tokens = torch.tensor(tokens)
+        # print(f"Loaded {len(self.tokens)} tokens")
 
         # * state
         self.curr_pos = self.B * self.T * self.process_rank
@@ -372,6 +397,8 @@ class DataloaderLite:
 
         # * if next batch causes out-of-bound reset to beginning
         if self.curr_pos + (B * T + 1) > len(self.tokens):
+            self.curr_shard = (self.curr_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.curr_shard])
             self.curr_pos = self.B * self.T * self.process_rank
 
         return x, y
@@ -383,7 +410,7 @@ class DataloaderLite:
 torch.cuda.manual_seed(1337)
 
 total_B = 2**19  # approx 0.5 million (as used in GPT-3 paper)
-B = 8  # micro batch size
+B = 32  # micro batch size
 T = 1024
 assert (
     total_B % (B * T * ddp_world_size) == 0
@@ -397,7 +424,7 @@ if master_process:
 
 
 train_loader = DataloaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size
+    B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size, split="train"
 )  # * max context/seq len of 1024
 
 # ! ____________________________________________________________________________________________________
@@ -424,8 +451,8 @@ raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = 0.1 * max_lr  # * 10% of max
-warmup_steps = 10  # * steps to get from 0 to max linearly
-max_steps = 50
+warmup_steps = 715  # * steps to get from 0 to max linearly with 375 mil tokens 
+max_steps = 19703
 
 
 def get_lr(step):
