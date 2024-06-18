@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import math, time, inspect, os
 
+import numpy as np
 import tiktoken
 
 import torch
@@ -15,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # * torchrun command sets env vars RANK, LOCAL_RANK, and WORLD_SIZE
 
 
-ddp = int(os.environ.get("RANK"), -1) != -1
+ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:  # ! -> torchrun --standalone --nproc_per_node=8 gpt2dotx.py
     # ! DDP reqiuires cuda as of right now
     assert torch.cuda.is_available(), "need cuda for DDP"
@@ -368,10 +369,10 @@ class DataloaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
 
         if master_process:
-            print(f"found {len(shards)] for split {split}")
+            print(f"found {len(shards)} for split {split}")
 
         self.curr_shard = 0
-        self.tokens = load_tokens(self.shards[self.curr_shard)]
+        self.tokens = load_tokens(self.shards[self.curr_shard])
         
         # with open("fineweb.txt", "r", encoding="utf-8") as f:
         #     text = f.read()
