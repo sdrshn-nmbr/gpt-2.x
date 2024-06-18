@@ -341,9 +341,10 @@ class GPT(nn.Module):
         return model
 
 def load_tokens(file):
-    npt = np.load(file)
+    npt = np.load(file, allow_pickle=True)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
+
 
 
 class DataloaderLite:
@@ -400,7 +401,7 @@ class DataloaderLite:
         if self.curr_pos + (B * T + 1) > len(self.tokens):
             self.curr_shard = (self.curr_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.curr_shard])
-            self.curr_pos = self.B * self.T * self.process_rank
+            self.curr_pos = B * T * self.process_rank
 
         return x, y
 
@@ -411,7 +412,7 @@ class DataloaderLite:
 torch.cuda.manual_seed(1337)
 
 total_B = 2**19  # approx 0.5 million (as used in GPT-3 paper)
-B = 32  # micro batch size
+B = 64  # micro batch size
 T = 1024
 assert (
     total_B % (B * T * ddp_world_size) == 0
@@ -453,7 +454,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = 0.1 * max_lr  # * 10% of max
 warmup_steps = 715  # * steps to get from 0 to max linearly with 375 mil tokens 
-max_steps = 19703
+max_steps = 19073
 
 
 def get_lr(step):
