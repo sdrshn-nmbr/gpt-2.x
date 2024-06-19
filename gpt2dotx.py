@@ -4,6 +4,8 @@ import math, time, inspect, os
 import numpy as np
 import tiktoken
 
+import hellaswag
+
 import torch
 torch.autograd.set_detect_anomaly(True)
 
@@ -416,11 +418,34 @@ class DataloaderLite:
 
 # ! ____________________________________________________________________________________________________
 
+# * Helper haha
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+# ! ____________________________________________________________________________________________________
+
 
 torch.cuda.manual_seed(1337)
 
 total_B = 2**19  # approx 0.5 million (as used in GPT-3 paper)
-B = 32  # micro batch size
+B = 16  # micro batch size
 T = 1024
 assert (
     total_B % (B * T * ddp_world_size) == 0
@@ -451,15 +476,18 @@ model = GPT(
 # model.eval() # ! only for inference
 model.to(device)
 
-# * significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
-model = torch.compile(model)
-
-# DPP container wrapping
+# ! using compile breaks evals - use for training ONLY
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+if use_compile:
+    # * significantly reduces run time by decreasing GPU to HBM memory transfers by simulating compilation instead of python interpretation
+    model = torch.compile(model)
 if ddp:
+# DPP container wrapping
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# ! raw model required for optimizer
-raw_model = model.module if ddp else model
+# * raw model required for optimizer
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
 
 # ! ____________________________________________________________________________________________________
 
@@ -489,12 +517,22 @@ optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device=device
 )
 
-# ! VALIDATION LOOP (every 100 iterations)
+# ! LOGGING ____________________________________________________________________________________________________
+
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open (log_file, "w") as f: # to clear the file
+    pass
+
 
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1)
     
-    if step % 100 == 0:
+    # ! VALIDATION LOOP (every 100 iterations)
+    
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         
@@ -517,8 +555,92 @@ for step in range(max_steps):
                 
             if master_process:
                 print(f"validation loss: {val_total_loss.item():.4f}")
+                with open (log_file, "w") as f:
+                    f.write(f"{step} val {val_total_loss.item():.4f}\n")
+                    
+    # ! HELLASWAG LOOP
+
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        
+        for i, example in enumerate(hellaswag.iterate_examples("val")):
+            
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            
+            # render the example into tokens and labels
+            _, tokens, mask, label = hellaswag.render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        
+        acc_norm = num_correct_norm / num_total
+        
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+                
+    # ! INFERENCE LOOP
+        
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode("Hello, I am a language model, ")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        
+
+        while xgen.size(1) < max_length:
+            #* forward the model to get the logits
+            with torch.no_grad():
+                logits = model(xgen)  #* (B, T, vocab_size)
+                #* take the logits at the last position
+                logits = logits[0][:, -1, :]  #* (B, vocab_size)
+                #* get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                #* do top-k sampling of 50 (huggingface pipeline default)
+                #* topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                #* select a token from the top-k probabilities
+                ix = torch.multinomial(topk_probs, 1)  #* (B, 1)
+                #* gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix)  #* (B, 1)
+                #* append to the sequence
+                x = torch.cat((xgen, xcol), dim=1)
+
+        for i in range(num_return_sequences):
+            tokens = x[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
     
-# ! TRAINING LOOP
+    # ! TRAINING/OPTIMIATION LOOP
 
     model.train()
     
@@ -538,7 +660,7 @@ for step in range(max_steps):
 
         if ddp:
             model.require_backward_grad_sync = model == grad_accum_steps - 1
-        loss.backward() # ! only fofr training aka for backprop
+        loss.backward() # ! only for training aka for backprop
 
     if ddp:
         dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
@@ -559,45 +681,7 @@ for step in range(max_steps):
         print(
             f"step {step:4d} | loss: {total_loss.item():.6f} | norm: {norm:.4f} | lr: {lr:.4e} | time: {dt} ms | tokens/s: {tps}"
         )
-if ddp:
+
+
+if ddp: # ! END
     dist.destroy_process_group()
-
-"""
-num_return_sequences = 30
-max_length = 20
-
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I am a language model, ")
-print(len(tokens))
-tokens = torch.tensor(tokens, dtype=torch.long)
-print(tokens.size())
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
-
-#* generate! right now x is (B, T) where B = 5, T = 8
-#* set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    #* forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x)  #* (B, T, vocab_size)
-        #* take the logits at the last position
-        logits = logits[:, -1, :]  #* (B, vocab_size)
-        #* get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        #* do top-k sampling of 50 (huggingface pipeline default)
-        #* topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        #* select a token from the top-k probabilities
-        ix = torch.multinomial(topk_probs, 1)  #* (B, 1)
-        #* gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix)  #* (B, 1)
-        #* append to the sequence
-        x = torch.cat((x, xcol), dim=1)
-
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
-"""
